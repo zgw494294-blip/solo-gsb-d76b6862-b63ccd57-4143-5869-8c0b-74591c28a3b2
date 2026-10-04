@@ -29,6 +29,12 @@ the downstream source node is replaced in place by a single projection that
 copies the mapped upstream export columns, and the upstream export together
 with its dependency ancestors is appended (ids renamed where they collide).
 Provenance at the replacement position is taken from the upstream graph.
+
+``preview`` runs the graph on caller-provided small samples (rows per source,
+equality conditions per filter) and returns the export's sampled columns and
+rows alongside the review — unless the review blocks the export, in which
+case only the review reasons are returned and no sample data leaves the
+service.
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ from .models import (
     ComposeRequest,
     FilterNodeIn,
     JoinNodeIn,
+    PreviewRequest,
     ProjectionNodeIn,
     PruneRequest,
     RenameRequest,
@@ -291,7 +298,9 @@ def _build_by_id(nodes: list[object]) -> dict[str, object]:
 
 
 def _evaluate_graph(
-    request: Union[ReviewRequest, ReviseRequest, PruneRequest, RenameRequest],
+    request: Union[
+        ReviewRequest, ReviseRequest, PruneRequest, RenameRequest, PreviewRequest
+    ],
 ) -> tuple[dict[str, object], list[str], dict[str, Relation]]:
     """Run every original validation rule and evaluate all relations.
 
@@ -1240,3 +1249,256 @@ def compose(request: ComposeRequest) -> dict[str, object]:
         ],
         "review": composed_review,
     }
+
+
+# ---------------------------------------------------------------------------
+# Small-sample preview
+# ---------------------------------------------------------------------------
+
+# Hard cap on every sampled relation: sources and every intermediate (and the
+# export itself) may produce at most this many rows before the whole request
+# is rejected without any partial data.
+ROW_LIMIT = 200
+
+# A sampled relation: output column names in order plus one positional value
+# list per row (aligned with the column names).
+Sample = tuple[list[str], list[list]]
+
+
+def _json_key(value: object) -> tuple[int, object]:
+    """Canonical equality key for JSON scalars (and null).
+
+    Equality follows JSON type and value: numbers compare by value across
+    int/float (``1`` equals ``1.0``), booleans are a distinct kind from
+    numbers (``true`` equals neither ``1`` nor ``0``), and null only equals
+    null. Python's numeric tower already hashes/compares ``1`` and ``1.0``
+    identically, so numbers can keep their value inside the key.
+    """
+    if value is None:
+        return (0, None)
+    if isinstance(value, bool):
+        return (1, value)
+    if isinstance(value, (int, float)):
+        return (2, value)
+    return (3, value)
+
+
+def _preview_source(node: SourceNodeIn, rows_in: list[dict[str, object]]) -> Sample:
+    """Align caller-provided rows with the source's declared column order."""
+    column_names = [c.name for c in node.columns]
+    column_set = set(column_names)
+    rows: list[list] = []
+    for index, row in enumerate(rows_in):
+        keys = set(row)
+        if keys != column_set:
+            raise ValidationError(
+                "PREVIEW_ROW_COLUMNS_MISMATCH",
+                f"row {index} of source node '{node.id}' must name exactly "
+                "the source's columns",
+                node.id,
+                {
+                    "row_index": index,
+                    "missing": [c for c in column_names if c not in keys],
+                    "extra": sorted(keys - column_set),
+                },
+            )
+        rows.append([row[c] for c in column_names])
+    return column_names, rows
+
+
+def _preview_filter(
+    node: FilterNodeIn, conditions: dict[str, object], upstream: Sample
+) -> Sample:
+    """Keep the rows satisfying every equality condition (AND), in order."""
+    in_columns, in_rows = upstream
+    reference_set = set(node.references)
+    keys = set(conditions)
+    if keys != reference_set:
+        raise ValidationError(
+            "PREVIEW_CONDITION_MISMATCH",
+            f"conditions for filter node '{node.id}' must name exactly its "
+            "references",
+            node.id,
+            {
+                "missing": [r for r in node.references if r not in keys],
+                "extra": sorted(keys - reference_set),
+            },
+        )
+    tests = [
+        (in_columns.index(ref), _json_key(conditions[ref]))
+        for ref in node.references
+    ]
+    # A null condition matches a null cell; the filter passes columns through.
+    rows = [
+        row
+        for row in in_rows
+        if all(_json_key(row[position]) == wanted for position, wanted in tests)
+    ]
+    return list(in_columns), rows
+
+
+def _preview_projection(node: ProjectionNodeIn, upstream: Sample) -> Sample:
+    """Apply the original copy/constant output definition to every row."""
+    in_columns, in_rows = upstream
+    plan: list[tuple[bool, object]] = []
+    for spec in node.columns:
+        if spec.is_constant:
+            plan.append((True, spec.constant))
+        else:
+            plan.append((False, in_columns.index(spec.copy_name)))
+    out_columns = [spec.name for spec in node.columns]
+    rows = [
+        [value if is_const else row[value] for is_const, value in plan]
+        for row in in_rows
+    ]
+    return out_columns, rows
+
+
+def _preview_join(node: JoinNodeIn, left: Sample, right: Sample) -> Sample:
+    """Inner-join the two samples on the original keys and output definition.
+
+    Null keys never match (not even null = null); duplicate keys keep every
+    left x right combination. The result order is left rows first, and for
+    each left row the matching right rows in their own order.
+    """
+    left_columns, left_rows = left
+    right_columns, right_rows = right
+    left_key_pos = left_columns.index(node.left_key)
+    right_key_pos = right_columns.index(node.right_key)
+
+    plan: list[tuple[int, int]] = []
+    for out in node.outputs:
+        if out.side == "left":
+            plan.append((0, left_columns.index(out.column)))
+        else:
+            plan.append((1, right_columns.index(out.column)))
+
+    right_index: dict[tuple[int, object], list[list]] = {}
+    for right_row in right_rows:
+        key = right_row[right_key_pos]
+        if key is None:
+            continue  # null keys never match
+        right_index.setdefault(_json_key(key), []).append(right_row)
+
+    rows: list[list] = []
+    for left_row in left_rows:
+        key = left_row[left_key_pos]
+        if key is None:
+            continue
+        for right_row in right_index.get(_json_key(key), ()):
+            rows.append(
+                [
+                    left_row[pos] if side == 0 else right_row[pos]
+                    for side, pos in plan
+                ]
+            )
+            if len(rows) > ROW_LIMIT:
+                # Fail fast instead of materialising a huge intermediate.
+                _raise_row_limit(node.id, len(rows))
+    return [out.alias for out in node.outputs], rows
+
+
+def _raise_row_limit(node_id: str, row_count: int) -> None:
+    raise ValidationError(
+        "PREVIEW_ROW_LIMIT",
+        f"node '{node_id}' would produce {row_count} rows in the preview, "
+        f"exceeding the {ROW_LIMIT}-row limit",
+        node_id,
+        {"row_count": row_count, "limit": ROW_LIMIT},
+    )
+
+
+def preview(request: PreviewRequest) -> dict[str, object]:
+    """Run the graph on caller-provided small samples and review the export.
+
+    The whole graph is validated under exactly the same rules as
+    :func:`review`. ``data`` must name exactly the source nodes among the
+    export and its ancestors (each row naming exactly the source's columns),
+    and ``conditions`` must name exactly the ancestor filter nodes (each
+    condition key set equal to the filter's ``references``). Sources and
+    every intermediate relation — the export included — are capped at
+    :data:`ROW_LIMIT` rows; any coverage, shape or limit violation rejects
+    the whole request without partial data.
+
+    The sample executes the original projection, passthrough and join output
+    definitions: row order follows the source input order, filters preserve
+    order, and a join emits left rows first with matching right rows in
+    order. Inputs and shared branches are never modified. When the review
+    blocks the export, only the review reasons are returned — no sample data.
+    """
+    by_id, order, relations = _evaluate_graph(request)
+    keep = _ancestors(request.export, by_id)
+
+    # --- coverage: data/conditions must name exactly the ancestor nodes ----
+    node_order = [node.id for node in request.nodes]
+    expected_sources = {
+        nid for nid in keep if isinstance(by_id[nid], SourceNodeIn)
+    }
+    expected_filters = {
+        nid for nid in keep if isinstance(by_id[nid], FilterNodeIn)
+    }
+
+    provided_sources = set(request.data)
+    missing_sources = expected_sources - provided_sources
+    extra_sources = provided_sources - expected_sources
+    if missing_sources or extra_sources:
+        raise ValidationError(
+            "PREVIEW_SOURCE_MISMATCH",
+            "data must name exactly the source nodes among the export and "
+            "its ancestors",
+            request.export,
+            {
+                "missing": [n for n in node_order if n in missing_sources],
+                "extra": sorted(extra_sources),
+            },
+        )
+
+    provided_filters = set(request.conditions)
+    missing_filters = expected_filters - provided_filters
+    extra_filters = provided_filters - expected_filters
+    if missing_filters or extra_filters:
+        raise ValidationError(
+            "PREVIEW_FILTER_MISMATCH",
+            "conditions must name exactly the filter nodes among the export "
+            "and its ancestors",
+            request.export,
+            {
+                "missing": [n for n in node_order if n in missing_filters],
+                "extra": sorted(extra_filters),
+            },
+        )
+
+    # --- evaluate the sample over the ancestor closure, in dependency order -
+    samples: dict[str, Sample] = {}
+    for nid in order:
+        if nid not in keep:
+            continue
+        node = by_id[nid]
+        if isinstance(node, SourceNodeIn):
+            sample = _preview_source(node, request.data[nid])
+        elif isinstance(node, ProjectionNodeIn):
+            sample = _preview_projection(node, samples[node.input])
+        elif isinstance(node, FilterNodeIn):
+            sample = _preview_filter(node, request.conditions[nid], samples[node.input])
+        else:
+            sample = _preview_join(
+                node, samples[node.left_input], samples[node.right_input]
+            )
+        if len(sample[1]) > ROW_LIMIT:
+            _raise_row_limit(nid, len(sample[1]))
+        samples[nid] = sample
+
+    review_result = _review_export(request.export, relations)
+    response: dict[str, object] = {
+        "export": request.export,
+        "blocked": review_result["blocked"],
+        "review": review_result,
+    }
+    if not review_result["blocked"]:
+        # Only a safe export may expose sample data, in the export's original
+        # column order.
+        response["columns"] = [
+            c.name for c in relations[request.export].columns
+        ]
+        response["rows"] = samples[request.export][1]
+    return response

@@ -250,3 +250,53 @@ class PruneRequest(StrictModel):
                 )
             seen.add(name)
         return self
+
+
+# ---------------------------------------------------------------------------
+# Small-sample preview
+# ---------------------------------------------------------------------------
+
+# A JSON scalar (string, number, boolean) or null. The preview endpoint only
+# accepts such values for sample cells, filter condition values and projection
+# constants, because they must reappear verbatim in the sampled output rows.
+# The smart union keeps the caller's exact type (``1`` stays an int, ``1.0`` a
+# float, ``true`` a bool) and rejects objects and arrays.
+JsonScalar = Union[str, int, float, bool, None]
+
+
+class PreviewProjectionColumnIn(ProjectionColumnIn):
+    """A projection column whose constant must be a JSON scalar or null.
+
+    Only the preview endpoint narrows constants this way — the original
+    endpoints keep accepting any JSON value for ``constant``.
+    """
+
+    constant: JsonScalar = None
+
+
+class PreviewProjectionNodeIn(ProjectionNodeIn):
+    columns: list[PreviewProjectionColumnIn] = Field(min_length=1)
+
+
+PreviewNodeIn = Annotated[
+    Union[SourceNodeIn, PreviewProjectionNodeIn, FilterNodeIn, JoinNodeIn],
+    Field(discriminator="type"),
+]
+
+
+class PreviewRequest(StrictModel):
+    """A review request plus per-source sample rows and per-filter conditions.
+
+    ``data`` maps each source node id to an array of row objects; every row
+    must name exactly the source's columns. ``conditions`` maps each filter
+    node id to its equality conditions (column name to constant; several
+    conditions are ANDed). Both maps must cover exactly the sources/filters
+    among the export and its ancestors — coverage, row keys, condition keys
+    and the 200-row limit are enforced in the engine together with the whole
+    original graph validation.
+    """
+
+    nodes: list[PreviewNodeIn] = Field(min_length=1, max_length=60)
+    export: str = Field(min_length=1)
+    data: dict[str, list[dict[str, JsonScalar]]] = Field(default_factory=dict)
+    conditions: dict[str, dict[str, JsonScalar]] = Field(default_factory=dict)

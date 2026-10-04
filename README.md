@@ -25,6 +25,10 @@
 只追加上游导出及其全部依赖祖先（沿用上游节点原序与列定义，ID 冲突自动改成全图唯一 ID），
 替换位置的内容与行影响取自上游，详见下文“拼接上游导出”。
 
+另提供 `POST /api/preview`：给加工图做**小样本预演**——按源 ID 提供样本行、按筛选 ID 提供等值
+条件，服务在样本上执行原图的投影、透传与连接语义，返回导出列序的 `columns` 与二维 `rows` 及
+审查结果；**一旦审查阻断，只返回审查原因，不返回任何样本数据**，详见下文“小样本预演”。
+
 ## 风险传播规则
 
 | 节点 | 行为 | 内容影响 | 行影响 |
@@ -758,6 +762,113 @@ curl -s -i -X POST http://localhost:8080/api/compose \
 #   "missing":["email","country"],"extra":[]}}
 ```
 
+## 小样本预演：POST /api/preview
+
+用**小样本**把整张加工图预演一遍：调用方按**源节点 ID** 提供样本行、按**筛选节点 ID** 提供
+等值条件，服务在样本上执行原图的投影、筛选（透传）与连接输出定义，返回**原导出列序**的
+`columns`、二维 `rows` 以及按原规则复审的 `review`。整张图仍按 `/api/review` 的原规则校验
+（`DUPLICATE_NODE` / `COLUMN_CONFLICT` / `INVALID_REFERENCE` / `CYCLE` 等同样整次拒绝）。
+
+请求体在审查请求（`nodes` + `export`）基础上增加：
+
+* `data`：`{"源ID": [{"列名": 单元格}, ...]}`——每个源节点的样本行数组；
+* `conditions`：`{"筛选ID": {"列名": 常量}}`——每个筛选节点的等值条件，**多个条件取 AND**。
+
+两个字段都可缺省（视为空表）；只要图中含有源/筛选，覆盖校验就会要求提供对应条目。
+
+### 输入契约（违反即整次拒绝，不返回部分数据）
+
+* `data` 的键必须**恰好**是导出及其祖先中的全部源节点（无关分支的源不得提供）：
+  `PREVIEW_SOURCE_MISMATCH`（400，含 `missing` / `extra`）；
+* `conditions` 的键必须**恰好**是导出及其祖先中的全部筛选节点：
+  `PREVIEW_FILTER_MISMATCH`（400，含 `missing` / `extra`）；
+* 每一行的键必须**恰好覆盖该源的全部列**（无缺漏、无多余）：
+  `PREVIEW_ROW_COLUMNS_MISMATCH`（400，含 `row_index` / `missing` / `extra`）；
+* 每个筛选的条件键集合必须**等于其 `references`**：
+  `PREVIEW_CONDITION_MISMATCH`（400，含 `missing` / `extra`）；
+* 单元格、条件值与投影常量只接受 **JSON 标量或 null**（字符串、数字、布尔、null）；
+  对象/数组属于 schema 问题，返回 422。**旧接口的常量范围不变**（`/api/review` 等仍接受任意
+  JSON 常量）；
+* **源及每个中间结果（含导出）最多 200 行**，超限整次拒绝：
+  `PREVIEW_ROW_LIMIT`（400，含 `row_count` / `limit`），不返回部分数据。
+
+### 样本语义
+
+* **相等**：按 JSON 类型和值判断——数字 `1` 与 `1.0` 相等；布尔与数字不同（`true` 不等于
+  `1`）；`null` 只等于 `null`；
+* **筛选**：保留同时满足全部条件的行（AND），`null` 条件匹配 `null` 单元格；保持输入行序，
+  全部列原样透传；
+* **连接**：内连接——`null` 键不参与匹配（`null` 不等于 `null`）；重复键保留全部组合；
+  结果行序为**左行优先、同一左行内按右行顺序**；输出按 `outputs` 定义取对应侧列值，列序即
+  别名序；
+* **投影**：`copy` 取上游列值、`constant` 置入常量，行序不变；
+* 预演**不修改输入图**，共享分支的样本只计算一次并复用于所有下游。
+
+### 响应
+
+未阻断时返回 `export`、`blocked: false`、原导出列序的 `columns`、二维 `rows` 及 `review`：
+
+```bash
+curl -s -X POST http://localhost:8080/api/preview \
+  -H 'Content-Type: application/json' \
+  --data @examples/preview_request.json
+```
+
+```json
+{
+  "export": "export_users",
+  "blocked": false,
+  "review": {"export": "export_users", "blocked": false, "columns": [
+    {"name": "user_id", "blocked": false, "content_reasons": [], "row_reasons": []},
+    {"name": "bucket", "blocked": false, "content_reasons": [], "row_reasons": []}]},
+  "columns": ["user_id", "bucket"],
+  "rows": [[1, "ALL"], [3, "ALL"]]
+}
+```
+
+（示例文件中源行 `uid` 1/2/3 的国家为 CN/US/CN，筛选 `country = "CN"` 后保留第 1、3 行。）
+
+**阻断时只返回审查原因，不返回样本数据**（`columns` / `rows` 不出现）。下例对敏感列
+`id_card` 做等值筛选，行影响落到导出每一列，预演被拒绝：
+
+```bash
+curl -s -X POST http://localhost:8080/api/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "nodes": [
+    {"id": "s", "type": "source",
+     "columns": [{"name": "id_card", "sensitive": true}, {"name": "score"}]},
+    {"id": "f", "type": "filter", "input": "s", "references": ["id_card"]},
+    {"id": "e", "type": "projection", "input": "f",
+     "columns": [{"name": "score", "copy": "score"}]}
+  ],
+  "export": "e",
+  "data": {"s": [{"id_card": "X", "score": 5}]},
+  "conditions": {"f": {"id_card": "X"}}
+}'
+```
+
+```json
+{
+  "export": "e",
+  "blocked": true,
+  "review": {"export": "e", "blocked": true, "columns": [
+    {"name": "score", "blocked": true, "content_reasons": [],
+     "row_reasons": [{"node_id": "s", "column": "id_card"}]}]}
+}
+```
+
+数据未恰好覆盖源、行键与源列不符、条件键不等于 `references`、任一结果超过 200 行时整次
+拒绝（400），不返回部分数据；非标量单元格/条件值/常量、未知字段等 schema 问题返回 422：
+
+```bash
+curl -s -i -X POST http://localhost:8080/api/preview \
+  -H 'Content-Type: application/json' \
+  -d "$(jq '.data = {}' examples/preview_request.json)"
+# HTTP/1.1 400 ... {"error":{"code":"PREVIEW_SOURCE_MISMATCH", ...
+#   "missing":["users"],"extra":[]}}
+```
+
 ## 节点 JSON 结构
 
 ```jsonc
@@ -793,11 +904,11 @@ python -m pytest tests/ -q
 ## 文件说明
 
 ```
-app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest 与 ComposeRequest）
-app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订、按列精简、源列批量改名与上下游拼接
-app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/health）
-examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json）
-tests/            传播规则、拒绝场景、修订/复审、精简、改名与拼接测试
+app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest 与 PreviewRequest）
+app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订、按列精简、源列批量改名、上下游拼接与小样本预演
+app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/health）
+examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json、preview_request.json）
+tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接与预演测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排
 ```
