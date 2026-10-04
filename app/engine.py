@@ -33,6 +33,7 @@ Provenance at the replacement position is taken from the upstream graph.
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict, deque
 from typing import Union
 
@@ -40,6 +41,7 @@ from .models import (
     ComposeRequest,
     FilterNodeIn,
     JoinNodeIn,
+    PreviewRequest,
     ProjectionNodeIn,
     PruneRequest,
     RenameRequest,
@@ -50,6 +52,10 @@ from .models import (
 
 # Hard cap shared with the request models: a revised graph may never exceed it.
 NODE_LIMIT = 60
+
+# Small-sample preview cap: every source and every intermediate relation may
+# hold at most this many rows; exceeding it rejects the whole preview request.
+PREVIEW_ROW_LIMIT = 200
 
 
 class ValidationError(Exception):
@@ -291,7 +297,9 @@ def _build_by_id(nodes: list[object]) -> dict[str, object]:
 
 
 def _evaluate_graph(
-    request: Union[ReviewRequest, ReviseRequest, PruneRequest, RenameRequest],
+    request: Union[
+        ReviewRequest, ReviseRequest, PruneRequest, RenameRequest, PreviewRequest
+    ],
 ) -> tuple[dict[str, object], list[str], dict[str, Relation]]:
     """Run every original validation rule and evaluate all relations.
 
@@ -1239,4 +1247,301 @@ def compose(request: ComposeRequest) -> dict[str, object]:
             {"from": old_id, "to": new_id} for old_id, new_id in id_map.items()
         ],
         "review": composed_review,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Small-sample preview of one export
+# ---------------------------------------------------------------------------
+#
+# A preview materializes the export relation over caller-provided sample rows.
+# The tables are plain column-aligned row lists (each row a dict keyed by the
+# node's output column names); the provenance machinery above is reused for
+# validation and review, but sample data never feeds the provenance logic and
+# the request objects / shared branches are never mutated — every node's
+# relation is materialized once, in topological order.
+
+
+# JSON scalar: str, bool, number (int/float, excluding non-finite values) or
+# null. ``bool`` is checked before numbers because ``isinstance(True, int)``.
+def _is_scalar(value: object) -> bool:
+    return value is None or isinstance(value, (str, bool, int)) or (
+        isinstance(value, float) and math.isfinite(value)
+    )
+
+
+def _scalar_equal(left: object, right: object) -> bool:
+    """JSON-type-and-value equality.
+
+    Numbers compare numerically (``1`` equals ``1.0``), booleans never equal
+    numbers (``True`` is not ``1``), and values of different JSON kinds never
+    match. ``None`` equals ``None``.
+    """
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        # bool was already handled above, so numeric int/float compares here.
+        return left == right
+    if isinstance(left, str) and isinstance(right, str):
+        return left == right
+    return False
+
+
+def _join_key(value: object) -> tuple[bool, object] | None:
+    """Hashable key for the inner join; ``None`` keys never match."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return (True, value)
+    if isinstance(value, (int, float)):
+        return (False, float(value))
+    if isinstance(value, str):
+        return (False, value)
+    return None  # non-scalar values are rejected before materialization
+
+
+def _reject_non_scalar_preview_constants(by_id: dict[str, object]) -> None:
+    """The preview restricts projection constants to JSON scalars or null.
+
+    This is a preview-only restriction: the other endpoints keep accepting the
+    old constant range unchanged. The whole graph is checked, like the rest of
+    the shared validation.
+    """
+    for nid, node in by_id.items():
+        if isinstance(node, ProjectionNodeIn):
+            for spec in node.columns:
+                if spec.is_constant and not _is_scalar(spec.constant):
+                    raise ValidationError(
+                        "PREVIEW_NON_SCALAR",
+                        "preview projection constants must be a JSON scalar "
+                        f"or null; projection node '{nid}' column "
+                        f"'{spec.name}' uses a non-scalar constant",
+                        nid,
+                        {"node_id": nid, "column": spec.name, "kind": "constant"},
+                    )
+
+
+def preview(request: PreviewRequest) -> dict[str, object]:
+    """Run a small-sample dry run of the export over caller-supplied rows.
+
+    The whole graph is validated under exactly the same rules as
+    :func:`review`. The ``rows`` map must cover exactly the source nodes in the
+    export's dependency closure (no missing, no extra — sources of unused
+    branches must not be supplied), with every row object keyed by exactly the
+    source's columns; the ``conditions`` map must cover exactly the closure's
+    filter nodes, each with a key set equal to that filter's ``references`` and
+    JSON scalar/null values; the predicates combine with AND. Cells and
+    projection constants are likewise restricted to JSON scalars/null.
+
+    When the export is blocked, the request is rejected (HTTP 400) carrying the
+    review result only — no sample data is ever returned. Otherwise the export
+    is materialized topologically (shared branches computed once, never
+    mutated): projections copy or substitute constants, filters pass all
+    columns through, joins are inner equi-joins (null keys never match,
+    duplicate keys keep every combination). Every source and intermediate
+    relation must stay within :data:`PREVIEW_ROW_LIMIT` rows; any overflow or
+    malformed input rejects the whole request without partial data.
+    """
+    by_id, order, relations = _evaluate_graph(request)
+
+    # --- closure: export plus its dependency ancestors ----------------------
+    keep = _ancestors(request.export, by_id)
+    source_ids = sorted(
+        nid for nid in keep if isinstance(by_id[nid], SourceNodeIn)
+    )
+    filter_ids = sorted(
+        nid for nid in keep if isinstance(by_id[nid], FilterNodeIn)
+    )
+
+    # --- rows/conditions cover exactly the closure's sources/filters --------
+    row_ids = set(request.rows)
+    condition_ids = set(request.conditions)
+    missing_sources = [nid for nid in source_ids if nid not in row_ids]
+    extra_rows = sorted(row_ids.difference(source_ids))
+    missing_filters = [nid for nid in filter_ids if nid not in condition_ids]
+    extra_conditions = sorted(condition_ids.difference(filter_ids))
+    if missing_sources or extra_rows:
+        raise ValidationError(
+            "PREVIEW_SOURCE_COVERAGE",
+            "the rows map must provide data for exactly the source nodes "
+            "reachable from the export node, neither more nor less",
+            request.export,
+            {"missing": missing_sources, "extra": extra_rows},
+        )
+    if missing_filters or extra_conditions:
+        raise ValidationError(
+            "PREVIEW_FILTER_COVERAGE",
+            "the conditions map must provide predicates for exactly the "
+            "filter nodes reachable from the export node, neither more nor "
+            "less",
+            request.export,
+            {"missing": missing_filters, "extra": extra_conditions},
+        )
+
+    # Preview-only scalar restriction on projection constants (whole graph).
+    _reject_non_scalar_preview_constants(by_id)
+
+    # --- per-source rows: row cap, exactly the source's columns, scalar cells
+    for nid in source_ids:
+        node = by_id[nid]
+        assert isinstance(node, SourceNodeIn)
+        input_rows = request.rows[nid]
+        expected = [c.name for c in node.columns]
+        expected_set = set(expected)
+        if len(input_rows) > PREVIEW_ROW_LIMIT:
+            raise ValidationError(
+                "PREVIEW_ROW_LIMIT",
+                f"source node '{nid}' provides {len(input_rows)} sample rows; "
+                f"the preview limit is {PREVIEW_ROW_LIMIT}",
+                nid,
+                {"node_id": nid, "row_count": len(input_rows),
+                 "limit": PREVIEW_ROW_LIMIT},
+            )
+        for index, row in enumerate(input_rows):
+            keys = set(row)
+            missing = [name for name in expected if name not in keys]
+            extra = sorted(keys.difference(expected_set))
+            if missing or extra:
+                raise ValidationError(
+                    "PREVIEW_ROW_KEYS",
+                    f"row {index} of source node '{nid}' must be keyed by "
+                    "exactly the source's columns",
+                    nid,
+                    {"node_id": nid, "row_index": index,
+                     "missing": missing, "extra": extra},
+                )
+            for name in expected:
+                if not _is_scalar(row[name]):
+                    raise ValidationError(
+                        "PREVIEW_NON_SCALAR",
+                        f"cell value of source node '{nid}' row {index} "
+                        f"column '{name}' must be a JSON scalar or null",
+                        nid,
+                        {"node_id": nid, "row_index": index,
+                         "column": name, "kind": "cell"},
+                    )
+
+    # --- per-filter conditions: key set == references, scalar values --------
+    for nid in filter_ids:
+        node = by_id[nid]
+        assert isinstance(node, FilterNodeIn)
+        expected = list(node.references)
+        expected_set = set(expected)
+        cond = request.conditions[nid]
+        keys = set(cond)
+        missing = [name for name in expected if name not in keys]
+        extra = sorted(keys.difference(expected_set))
+        if missing or extra:
+            raise ValidationError(
+                "PREVIEW_CONDITION_KEYS",
+                f"conditions of filter node '{nid}' must be keyed by exactly "
+                "the filter's references",
+                nid,
+                {"node_id": nid, "missing": missing, "extra": extra},
+            )
+        for name in expected:
+            if not _is_scalar(cond[name]):
+                raise ValidationError(
+                    "PREVIEW_NON_SCALAR",
+                    f"condition value of filter node '{nid}' column '{name}' "
+                    "must be a JSON scalar or null",
+                    nid,
+                    {"node_id": nid, "column": name, "kind": "condition"},
+                )
+
+    # A blocked export must never expose sample data: return the review
+    # reasons alone (HTTP 400), not columns/rows.
+    review_result = _review_export(request.export, relations)
+    if review_result["blocked"]:
+        raise ValidationError(
+            "PREVIEW_BLOCKED",
+            "the export is blocked by sensitive content or row-level "
+            "influence; sample data is not returned for blocked exports",
+            request.export,
+            {"review": review_result},
+        )
+
+    # --- materialize the closure once, in topological order -----------------
+    tables: dict[str, list[dict[str, object]]] = {}
+    for nid in order:
+        if nid not in keep:
+            continue
+        node = by_id[nid]
+
+        if isinstance(node, SourceNodeIn):
+            # Preserve the supplied row order and the node's column order.
+            table = [
+                {name: row[name] for name in (c.name for c in node.columns)}
+                for row in request.rows[nid]
+            ]
+
+        elif isinstance(node, ProjectionNodeIn):
+            upstream = tables[node.input]
+            table = []
+            for row in upstream:
+                out: dict[str, object] = {}
+                for spec in node.columns:
+                    if spec.is_constant:
+                        out[spec.name] = spec.constant
+                    else:
+                        out[spec.name] = row[spec.copy_name]
+                table.append(out)
+
+        elif isinstance(node, FilterNodeIn):
+            cond = request.conditions[nid]
+            # Filter order is stable: survivors keep the upstream row order;
+            # every reference must compare equal (AND), null matches null.
+            table = [
+                row
+                for row in tables[node.input]
+                if all(
+                    _scalar_equal(row[name], cond[name]) for name in cond
+                )
+            ]
+
+        else:  # JoinNodeIn — inner equi-join
+            left_rows = tables[node.left_input]
+            right_rows = tables[node.right_input]
+            right_index: dict[object, list[dict[str, object]]] = defaultdict(list)
+            for row in right_rows:
+                key = _join_key(row[node.right_key])
+                if key is not None:
+                    right_index[key].append(row)
+
+            table = []
+            for left in left_rows:
+                key = _join_key(left[node.left_key])
+                if key is None:
+                    continue
+                # Outer left rows, inner right rows: the nested-loop order of
+                # every (left, right) combination. Duplicate keys on either
+                # side keep all combinations.
+                for right in right_index.get(key, ()):
+                    combined: dict[str, object] = {}
+                    for out_spec in node.outputs:
+                        source_row = left if out_spec.side == "left" else right
+                        source_col = out_spec.column
+                        combined[out_spec.alias] = source_row[source_col]
+                    table.append(combined)
+
+        if len(table) > PREVIEW_ROW_LIMIT:
+            raise ValidationError(
+                "PREVIEW_ROW_LIMIT",
+                f"intermediate node '{nid}' yields {len(table)} sample rows; "
+                f"the preview limit is {PREVIEW_ROW_LIMIT}",
+                nid,
+                {"node_id": nid, "row_count": len(table),
+                 "limit": PREVIEW_ROW_LIMIT},
+            )
+        tables[nid] = table
+
+    export_table = tables[request.export]
+    export_columns = [c.name for c in relations[request.export].columns]
+    return {
+        "export": request.export,
+        "columns": export_columns,
+        "rows": [[row[name] for name in export_columns] for row in export_table],
+        "review": review_result,
     }

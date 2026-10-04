@@ -3,9 +3,18 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .engine import ValidationError, compose, prune, rename, review, revise
+from .engine import (
+    ValidationError,
+    compose,
+    preview,
+    prune,
+    rename,
+    review,
+    revise,
+)
 from .models import (
     ComposeRequest,
+    PreviewRequest,
     PruneRequest,
     RenameRequest,
     ReviewRequest,
@@ -20,11 +29,14 @@ app = FastAPI(
         "graph into a re-submittable, review-safe export, can prune a graph "
         "down to a chosen subset of export columns, can batch-rename "
         "columns of a source node while keeping every in-graph reference "
-        "pointing at the same original columns, and can compose an upstream "
+        "pointing at the same original columns, can compose an upstream "
         "graph's export into a downstream graph's source position, yielding "
-        "one reviewable combined graph."
+        "one reviewable combined graph, and can run a small-sample preview "
+        "of an export over caller-provided source rows and filter "
+        "conditions, returning sample data only when the export passes "
+        "review."
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -70,3 +82,8 @@ async def rename_source_columns(request: RenameRequest) -> dict[str, object]:
 @app.post("/api/compose")
 async def compose_graphs(request: ComposeRequest) -> dict[str, object]:
     return compose(request)
+
+
+@app.post("/api/preview")
+async def preview_export(request: PreviewRequest) -> dict[str, object]:
+    return preview(request)

@@ -226,6 +226,26 @@ class ComposeRequest(StrictModel):
         return self
 
 
+class PreviewRequest(StrictModel):
+    """A small-sample dry run of one export over caller-provided source rows.
+
+    Besides a review-shaped graph (``nodes`` + ``export``), the caller gives
+    ``rows`` keyed by source node id (ordered row arrays) and ``conditions``
+    keyed by filter node id (column name -> equality constant). Both maps
+    must cover *exactly* the source/filter nodes among the export's dependency
+    ancestors; every row object must carry exactly that source's columns and
+    every condition object exactly the filter's ``references``. Coverage and
+    key-set mismatches, the scalar-only value restriction and the 200-row cap
+    are engine-level rejections (HTTP 400); structural problems such as wrong
+    field types or unknown fields stay HTTP 422.
+    """
+
+    nodes: list[NodeIn] = Field(min_length=1, max_length=60)
+    export: str = Field(min_length=1)
+    rows: dict[str, list[dict[str, object]]]
+    conditions: dict[str, dict[str, object]] = Field(default_factory=dict)
+
+
 class PruneRequest(StrictModel):
     """A review request plus the export columns the caller wants to keep.
 
